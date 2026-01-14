@@ -48,6 +48,8 @@ if __name__ == "__main__":
     # coarse search
     # lrs = [1e-4, 2e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3, 3e-3, 5e-3, 8e-3, 1e-2]
     # refinement
-    lrs = [5e-4, 8e-4, 1.0e-3, 1.2e-3, 1.5e-3, 1.8e-3, 2.0e-3, 2.2e-3]
+    # lrs = [5e-4, 8e-4, 1.0e-3, 1.2e-3, 1.5e-3, 1.8e-3, 2.0e-3, 2.2e-3]
+    # Divergence
+    lrs = [1e-3, 4e-3, 8e-3, 1.6e-2, 3.2e-2, 6.4e-2, 1e-1]
 
     main(lrs)
