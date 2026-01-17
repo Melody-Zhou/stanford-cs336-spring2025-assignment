@@ -4,6 +4,7 @@ import argparse
 import statistics as stats
 from contextlib import nullcontext
 from cs336_basics.transformer_lm import TransformerLM
+from cs336_systems.utils import BenchmarkReporter, BenchmarkRow
 
 
 # Table 1 defaults
@@ -13,6 +14,14 @@ MODEL_SPECS = {
     "large":  dict(d_model=1280, d_ff=5120,  num_layers=36, num_heads=20),
     "xl":     dict(d_model=1600, d_ff=6400,  num_layers=48, num_heads=25),
     "2.7b":   dict(d_model=2560, d_ff=10240, num_layers=32, num_heads=32),
+}
+
+MODEL_SPECS_RTX4060 = {
+    "small":  dict(d_model=384, d_ff=1536, num_layers=6,  num_heads=6),   # 384/6=64
+    "medium": dict(d_model=512, d_ff=2048, num_layers=8,  num_heads=8),   # 512/8=64
+    "large":  dict(d_model=640, d_ff=2560, num_layers=10, num_heads=10),  # 640/10=64
+    "xl":     dict(d_model=768, d_ff=3072, num_layers=12, num_heads=12),  # 768/12=64
+    "2.7b":   dict(d_model=768, d_ff=3072, num_layers=16, num_heads=12),  # 768/12=64
 }
 
 
@@ -27,13 +36,13 @@ def torch_dtype_from_string(s: str) -> torch.dtype:
     raise ValueError(f"Unknown dtype: {s}")
 
 
-def sycn_if_cuda(device: torch.device) -> None:
+def sync_if_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
 
 
 def make_model(args, device: torch.device) -> torch.nn.Module:
-    spec = MODEL_SPECS[args.model_size]
+    spec = MODEL_SPECS_RTX4060[args.model_size]
     model = TransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -57,32 +66,155 @@ def make_batch(args, device: torch.device) -> torch.Tensor:
     return x
 
 
-def run_one_step(model, x, args, autocast_ctx):
-    # Forward
+def step_forward(model, x, autocast_ctx):
     with autocast_ctx:
-        logits = model(x)   # (B, S, V)
-        if args.forward_only:
-            loss = None
-        else:
-            # Use a cheap scalar loss that still builds a full backward graph
-            loss = logits.float().mean()
-    
-    # Backward
-    if not args.forward_only:
-        model.zero_grad(set_to_none=True)
-        loss.backward()
+        logits = model(x)
+    return logits
+
+
+def step_backward(model, logits):
+    # cheap scalar loss, but builds backward
+    loss = logits.float().mean()
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+
+
+def measure_forward_backward_ms(model, x, device, autocast_ctx):
+    """
+    Return (forward_ms, backward_ms) for one step.
+    Uses CUDA events when on GPU, otherwise falls back to timeit.
+    """
+    if device.type == "cuda":
+        # CUDA event timing is more accurate than timeit + sync for segments.
+        start_f = torch.cuda.Event(enable_timing=True)
+        end_f = torch.cuda.Event(enable_timing=True)
+        start_b = torch.cuda.Event(enable_timing=True)
+        end_b = torch.cuda.Event(enable_timing=True)
+
+        start_f.record()
+        logits = step_forward(model, x, autocast_ctx)
+        end_f.record()
+
+        start_b.record()
+        step_backward(model, logits)
+        end_b.record()
+
+        torch.cuda.synchronize()
+        f_ms = start_f.elapsed_time(end_f)
+        b_ms = start_b.elapsed_time(end_b)
+        return f_ms, b_ms
+
+    # CPU fallback
+    t0 = timeit.default_timer()
+    logits = step_forward(model, x, autocast_ctx)
+    t1 = timeit.default_timer()
+    step_backward(model, logits)
+    t2 = timeit.default_timer()
+    return (t1 - t0) * 1e3, (t2 - t1) * 1e3
+
+
+def run_benchmark_split(args, device, autocast_ctx):
+    """
+    Warmup then measure forward/backward separately.
+    Return:
+      forward_times_ms, backward_times_ms
+    """
+    model = make_model(args, device)
+    x = make_batch(args, device)
+
+    # Warmup
+    for _ in range(args.warmup_steps):
+        f_ms, b_ms = measure_forward_backward_ms(model, x, device, autocast_ctx)
+        # Already synchronized in CUDA path; keep this for safety/CPU
+        sync_if_cuda(device)
+
+    f_times = []
+    b_times = []
+    for _ in range(args.measure_steps):
+        f_ms, b_ms = measure_forward_backward_ms(model, x, device, autocast_ctx)
+        f_times.append(f_ms)
+        b_times.append(b_ms)
+
+    return f_times, b_times
+
+
+def stats_ms(times_ms):
+    mean = stats.mean(times_ms)
+    std = stats.pstdev(times_ms) if len(times_ms) > 1 else 0.0
+    return mean, std
+
+
+def emit_row(args, reporter, device: torch.device, mode: str, mean_ms: float, std_ms: float, tok_s: float):
+    row = BenchmarkRow(
+        specs="RTX4060",
+        model_size=args.model_size,
+        batch_size=args.batch_size,
+        context_length=args.context_length,
+        vocab_size=args.vocab_size,
+        amp=args.amp,
+        mode=mode,
+        warmup_steps=args.warmup_steps,
+        measure_steps=args.measure_steps,
+        mean_ms=mean_ms,
+        std_ms=std_ms,
+        tok_per_step=args.batch_size * args.context_length,
+        tok_per_s=tok_s,
+        device=str(device),
+    )
+
+    if reporter is not None:
+        reporter.append_and_maybe_write(row, write_md=args.write_md)
+
+
+def run_one_setting(args, reporter, device: torch.device, autocast_ctx):
+    spec = MODEL_SPECS_RTX4060[args.model_size]
+
+    f_times_ms, b_times_ms = run_benchmark_split(args, device, autocast_ctx)
+
+    f_mean, f_std = stats_ms(f_times_ms)
+    b_mean, b_std = stats_ms(b_times_ms)
+
+    tok_per_step = args.batch_size * args.context_length
+    f_tok_s = tok_per_step / (f_mean / 1e3) if f_mean > 0 else float("inf")
+    b_tok_s = tok_per_step / (b_mean / 1e3) if b_mean > 0 else float("inf")
+
+    print(f"[device={device}] specs=RTX4060 amp={args.amp}")
+    print(f"model={args.model_size} B={args.batch_size} S={args.context_length} V={args.vocab_size}")
+    print(f"warmup={args.warmup_steps} measure={args.measure_steps}")
+    print(f"forward : mean={f_mean:.3f} ms, std={f_std:.3f} ms, tok/s={f_tok_s:.1f}")
+    print(f"backward: mean={b_mean:.3f} ms, std={b_std:.3f} ms, tok/s={b_tok_s:.1f}")
+
+    emit_row(args, reporter, device, "forward", f_mean, f_std, f_tok_s)
+    emit_row(args, reporter, device, "backward", b_mean, b_std, b_tok_s)
+
+
+def run_sweep(args, reporter, device: torch.device, autocast_ctx):
+    models = [s.strip() for s in args.sweep_models.split(",") if s.strip()]
+    contexts = [int(x.strip()) for x in args.sweep_contexts.split(",") if x.strip()]
+
+    for m in models:
+        for s in contexts:
+            args.model_size = m
+            args.context_length = s
+            try:
+                run_one_setting(args, reporter, device, autocast_ctx)
+            except torch.OutOfMemoryError:
+                print(f"[OOM] model={m} S={s}")
+                emit_row(args, reporter, device, "forward", float("nan"), float("nan"), float("nan"))
+                emit_row(args, reporter, device, "backward", float("nan"), float("nan"), float("nan"))
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model-size", choices=list(MODEL_SPECS.keys()), default="small")
+    p.add_argument("--model-size", choices=list(MODEL_SPECS_RTX4060.keys()), default="small")
     p.add_argument("--context-length", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--vocab-size", type=int, default=10_000)
 
     p.add_argument("--warmup-steps", type=int, default=5)
     p.add_argument("--measure-steps", type=int, default=10)
-    p.add_argument("--forward-only", action="store_true")
 
     # Mixed precision hook
     p.add_argument("--amp", choices=["none", "bf16", "fp16"], default="none")
@@ -95,6 +227,17 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--allow-tf32", action="store_true")
 
+    # Reporter
+    p.add_argument("--out-jsonl", type=str, default=None)
+    p.add_argument("--out-md", type=str, default=None)
+    p.add_argument("--write-md", action="store_true", help="If set, refresh markdown after appending a row.")
+
+    # Sweep runner
+    p.add_argument("--sweep", action="store_true",
+                   help="Run sweep over model sizes and context lengths.")
+    p.add_argument("--sweep-models", type=str, default="small,medium,large,xl,2.7b")
+    p.add_argument("--sweep-contexts", type=str, default="128,256,512,1024")    
+
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -104,9 +247,6 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
         torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
 
-    model = make_model(args, device)
-    x = make_batch(args, device)
-
     # Autocast context (no-op on CPU)
     if device.type == "cuda" and args.amp != "none":
         amp_dtype = torch_dtype_from_string(args.amp)
@@ -114,31 +254,31 @@ def main():
     else:
         autocast_ctx = nullcontext()
 
-    # Warm-up
-    for _ in range(args.warmup_steps):
-        run_one_step(model, x, args, autocast_ctx)
-        sycn_if_cuda(device)
+    reporter = None
+    if args.out_jsonl:
+        reporter = BenchmarkReporter(
+            jsonl_path=args.out_jsonl,
+            md_path=args.out_md,
+            title="#### Forward / Backward timing"
+        )
 
-    # Timed steps
-    times = []
-    for _ in range(args.measure_steps):
-        t0 = timeit.default_timer()
-        run_one_step(model, x, args, autocast_ctx)
-        sycn_if_cuda(device)
-        t1 = timeit.default_timer()
-        times.append(t1 - t0)
+    if args.sweep:
+        run_sweep(args, reporter, device, autocast_ctx)
+    else:
+        run_one_setting(args, reporter, device, autocast_ctx)
 
-    mean_s = stats.mean(times)
-    std_s = stats.pstdev(times) if len(times) > 1 else 0.0
-
-    tok_per_step = args.batch_size * args.context_length
-    tok_s = tok_per_step / mean_s if mean_s > 0 else float("inf")
-
-    mode = "forward" if args.forward_only else "forward+backward"
-    print(f"[device={device}] mode={mode} amp={args.amp}")
-    print(f"model={args.model_size} B={args.batch_size} S={args.context_length} V={args.vocab_size}")
-    print(f"warmup={args.warmup_steps} measure={args.measure_steps}")
-    print(f"step time: mean={mean_s*1e3:.3f} ms, std={std_s*1e3:.3f} ms, tok/s={tok_s:.1f}")
 
 if __name__ == "__main__":
     main()
+
+    # ---------------------------------------------------------------------
+    # (b) Forward / backward runtime benchmarking
+    #
+    # Forward + backward (measures forward pass time):
+    #   uv run python cs336_systems/benchmark.py \
+    #     --out-jsonl runs/bench.jsonl \
+    #     --out-md runs/bench.md \
+    #     --write-md \
+    #     --sweep \
+    #     --sweep-contexts 128
+    # ---------------------------------------------------------------------
