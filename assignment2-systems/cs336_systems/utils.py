@@ -22,6 +22,7 @@ class BenchmarkRow:
     tok_per_step: int
     tok_per_s: float
     device: str
+    impl: str   # "eager" / "compiled"
 
 
 class BenchmarkReporter:
@@ -47,13 +48,14 @@ class BenchmarkReporter:
         self.md_path = Path(md_path) if md_path else None
 
         self.float_fmt = float_fmt
-        self.sort_cols = sort_cols or ["specs", "model_size", "context_length", "mode", "amp"]
+        self.sort_cols = sort_cols or ["specs", "model_size", "context_length", "mode", "amp", "impl"]
         self.cols = cols or [
             "specs",
             "model_size",
             "context_length",
             "batch_size",
             "amp",
+            "impl",
             "mode",
             "mean_ms",
             "std_ms",
@@ -158,3 +160,83 @@ class BenchmarkReporter:
         centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
 
         return "\n".join([header, centered] + lines[2:])
+
+
+@dataclass
+class AttentionRow:
+    d_model: int
+    seq_len: int
+    fwd_ms: Optional[float]
+    bwd_ms: Optional[float]
+    mem_before_bwd_mb: Optional[float]
+    status: str  # "ok" / "oom" / "error:<Type>"
+    impl: str = "eager"
+
+
+class AttentionBenchmarkReporter:
+    """
+    Similar spirit to BenchmarkReporter:
+      - append JSONL
+      - render markdown table
+      - write markdown to file
+    """
+
+    def __init__(self, jsonl_path: str | Path, md_path: str | Path, *, title: str = "#### PyTorch attention (naive)"):
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: AttentionRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records: List[Dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    @staticmethod
+    def _center_align_markdown(md: str) -> str:
+        lines = md.splitlines()
+        if len(lines) < 2:
+            return md
+        header = lines[0]
+        cols = header.count("|") - 1
+        centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
+        return "\n".join([lines[0], centered] + lines[2:])
+
+    def render_markdown(self) -> str:
+        df = self.read_df()
+        if df.empty:
+            return f"{self.title}\n\n(no rows)\n"
+
+        # Sort for readability
+        sort_cols = ["d_model", "seq_len"]
+        if "impl" in df.columns:
+            sort_cols.append("impl")
+        df = df.sort_values(sort_cols, ascending=True)
+
+        # Format floats
+        for c in ["fwd_ms", "bwd_ms", "mem_before_bwd_mb"]:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
+
+        md = []
+        md.append(self.title)
+        md.append("")
+        table = df.to_markdown(index=False)
+        table = self._center_align_markdown(table)
+        md.append(table)
+        md.append("")
+        return "\n".join(md)
+
+    def write_markdown(self) -> None:
+        self.md_path.write_text(self.render_markdown(), encoding="utf-8")
