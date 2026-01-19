@@ -72,6 +72,8 @@ def make_model(args, device: torch.device) -> torch.nn.Module:
         dtype=torch.float32  # default
     ).to(device)
     model.train()
+    if getattr(args, "compile", False):
+        model = torch.compile(model)
     return model
 
 
@@ -202,6 +204,7 @@ def emit_row(args, reporter, device: torch.device, mode: str, mean_ms: float, st
         tok_per_step=args.batch_size * args.context_length,
         tok_per_s=tok_s,
         device=str(device),
+        impl=("compiled" if getattr(args, "compile", False) else "eager"),
     )
 
     if reporter is not None:
@@ -376,6 +379,8 @@ def main():
     p.add_argument("--mem-max-entries", type=int, default=1_000_000,
                    help="Max entries for torch.cuda.memory._record_memory_history.")
 
+    # Pytorch compile
+    p.add_argument("--compile", action="store_true", help="Compile the whole Transformer model with torch.compile")
 
     args = p.parse_args()
 
@@ -422,9 +427,9 @@ if __name__ == "__main__":
     main()
 
     # ---------------------------------------------------------------------
-    # (b) Forward / backward runtime benchmarking
+    # ## 1. Problem (benchmarking_script)
     #
-    # Forward + backward (measures forward pass time):
+    # (b) Forward + backward (measures forward pass time):
     #   uv run python cs336_systems/benchmark.py \
     #     --out-jsonl runs/bench.jsonl \
     #     --out-md runs/bench.md \
@@ -433,14 +438,14 @@ if __name__ == "__main__":
     #     --sweep-contexts 128
     # 
     # 
-    # (a) Nsys profile 
+    # ## 2. Problem (nsys_profile)
     # 
-    # bash scripts/profile_nsys_models.sh
-    # 
+    # (a) Nsys profile: 
+    #   bash scripts/profile_nsys_models.sh
     # 
     # (d) Train step
     # 
-    # Foward-only
+    # Foward-only:
     #   uv run nsys profile \
     #     -o runs/nsys_d_infer_2.7b_s128 \
     #     --force-overwrite=true \
@@ -451,7 +456,7 @@ if __name__ == "__main__":
     #     --model-size 2.7b --context-length 128 \
     #     --nvtx --profile --profile-mode inference --profile-steps 1
     # 
-    # Forward + CE + Backward + AdamW
+    # Forward + CE + Backward + AdamW:
     #   uv run nsys profile \
     #     -o runs/nsys_d_train_2.7b_s128 \
     #     --force-overwrite=true \
@@ -462,10 +467,7 @@ if __name__ == "__main__":
     #     --model-size 2.7b --context-length 128 \
     #     --nvtx --profile --profile-mode train_step --profile-steps 1
     #
-    # 
-    # (e) NVTX-annotated attention
-    # 
-    # Foward-only with attention NVTX
+    # (e) NVTX-annotated attention:
     #   uv run nsys profile -o runs/nsys_e_attn_2p7b_s128 \
     #     --force-overwrite=true --trace=cuda,nvtx --sample=none --cpuctxsw=none \
     #     python cs336_systems/benchmark.py \
@@ -474,9 +476,9 @@ if __name__ == "__main__":
     #     --profile --profile-mode inference --profile-steps 1 --warmup-steps 1
     # 
     # 
-    # (c) Mix precision
+    # ## 3. Problem (mixed_precision_accumulation)
     # 
-    # Mix precision benchmarking
+    # (c) Mix precision benchmarking:
     #   uv run python cs336_systems/benchmark.py \
     #     --out-jsonl runs/bench.jsonl \
     #     --out-md runs/bench.md \
@@ -485,11 +487,24 @@ if __name__ == "__main__":
     #     --sweep-contexts 128
     #     --amp bf16
     # 
-    # (a) Memory profiling
     # 
-    # Memory profiling with PyTorch memory snapshot
+    # ## 4. Problem (memory_profiling)
+    # 
+    # (a) Memory profiling with PyTorch memory snapshot:
     #   uv run python cs336_systems/benchmark.py \
     #     --model-size 2.7b --context-length 128 \
     #     --profile --profile-mode inference --profile-steps 1 --warmup-steps 5 \
     #     --mem-profile --mem-out runs/mem_2p7b
+    # 
+    # 
+    # 5. Problem (torch_compile)
+    # 
+    # (b) Torch compile:
+    #   uv run python cs336_systems/benchmark.py \
+    #     --out-jsonl runs/bench.jsonl \
+    #     --out-md runs/bench.md \
+    #     --write-md \
+    #     --sweep \
+    #     --sweep-contexts 128 \
+    #     --compile
     # ---------------------------------------------------------------------
