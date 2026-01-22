@@ -318,4 +318,70 @@ class FlashBenchmarkReporter:
 
     def write_markdown(self) -> None:
         self.md_path.write_text(self.render_markdown(), encoding="utf-8")
-        
+
+
+@dataclass
+class LeaderboardBenchRow:
+    variant: str               # e.g. "baseline"
+    dtype: str                 # "bf16"
+    seq_len: int               # S
+    n_heads: int               # H
+    d_head: int                # Dh
+    fwd_ms: Optional[float]
+    bwd_ms: Optional[float]
+    e2e_ms: Optional[float]
+    status: str                # "ok" / "oom" / "error:<Type>"
+
+
+class LeaderboardBenchmarkReporter:
+    def __init__(self, jsonl_path: str | Path, md_path: str | Path, *, title: str):
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: LeaderboardBenchRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records: List[Dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    @staticmethod
+    def _center_align_markdown(md: str) -> str:
+        lines = md.splitlines()
+        if len(lines) < 2:
+            return md
+        header = lines[0]
+        cols = header.count("|") - 1
+        centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
+        return "\n".join([lines[0], centered] + lines[2:])
+
+    def render_markdown(self) -> str:
+        df = self.read_df()
+        if df.empty:
+            return f"{self.title}\n\n(no rows)\n"
+
+        # 排序：先 variant，再 dtype，再 seq，再 head/dh
+        sort_cols = ["variant", "dtype", "seq_len", "n_heads", "d_head"]
+        df = df.sort_values(sort_cols, ascending=True)
+
+        # format floats
+        for c in ["fwd_ms", "bwd_ms", "e2e_ms"]:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
+
+        md = [self.title, "", self._center_align_markdown(df.to_markdown(index=False)), ""]
+        return "\n".join(md)
+
+    def write_markdown(self) -> None:
+        self.md_path.write_text(self.render_markdown(), encoding="utf-8")
