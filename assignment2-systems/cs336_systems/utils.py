@@ -240,3 +240,82 @@ class AttentionBenchmarkReporter:
 
     def write_markdown(self) -> None:
         self.md_path.write_text(self.render_markdown(), encoding="utf-8")
+
+
+@dataclass
+class FlashBenchRow:
+    impl: str                   # "baseline" or "flash"
+    dtype: str                  # "bf16" / "fp32"
+    seq_len: int
+    d_model: int
+    fwd_ms: Optional[float]
+    bwd_ms: Optional[float]
+    e2e_ms: Optional[float]
+    status: str                 # "ok" / "oom" / "error:<Type>"
+
+
+class FlashBenchmarkReporter:
+    def __init__(
+        self,
+        jsonl_path: str | Path,
+        md_path: str | Path,
+        *,
+        title: str = "#### FlashAttention-2 (Triton) vs Baseline (PyTorch)"
+    ):
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: FlashBenchRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records: List[Dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    @staticmethod
+    def _center_align_markdown(md: str) -> str:
+        lines = md.splitlines()
+        if len(lines) < 2:
+            return md
+        header = lines[0]
+        cols = header.count("|") - 1
+        centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
+        return "\n".join([lines[0], centered] + lines[2:])
+
+    def render_markdown(self) -> str:
+        df = self.read_df()
+        if df.empty:
+            return f"{self.title}\n\n(no rows)\n"
+
+        # Sort for readability
+        sort_cols = ["dtype", "seq_len", "d_model", "impl"]
+        df = df.sort_values(sort_cols, ascending=True)
+
+        # Format floats
+        for c in ["fwd_ms", "bwd_ms", "e2e_ms"]:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
+
+        md = []
+        md.append(self.title)
+        md.append("")
+        table = df.to_markdown(index=False)
+        table = self._center_align_markdown(table)
+        md.append(table)
+        md.append("")
+        return "\n".join(md)
+
+    def write_markdown(self) -> None:
+        self.md_path.write_text(self.render_markdown(), encoding="utf-8")
+        
