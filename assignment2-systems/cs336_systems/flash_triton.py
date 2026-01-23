@@ -20,45 +20,92 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
-    IS_CAUSAL: tl.constexpr
+    IS_CAUSAL: tl.constexpr,
 ):
     # program ids
     pid_q = tl.program_id(0)  # query tile id
     pid_b = tl.program_id(1)  # batch id
 
-    # offsets
-    q_offsets = pid_q * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)  # [Bq]
-    d_offsets = tl.arange(0, D)  # [D]
+    # block pointers for Q/K/V/O/L tiles
+    # block pointers encapsulate base, shape, strides, and OOB handling;
+    # advancing them avoids re-materializing raw pointer arithmetic in the loop
+    Qb = Q_ptr + pid_b * stride_qb
+    Kb = K_ptr + pid_b * stride_kb
+    Vb = V_ptr + pid_b * stride_vb
+    Ob = O_ptr + pid_b * stride_ob
+    Lb = L_ptr + pid_b * stride_lb
 
-    # pointers for Q tile: (Bq, D)
-    q_ptrs = Q_ptr + pid_b * stride_qb + q_offsets[:, None] * stride_qq + d_offsets[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=(q_offsets[:, None] < N_QUERIES), other=0.0).to(tl.float32)
+    Q_bp = tl.make_block_ptr(
+        base=Qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(pid_q * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    K_bp = tl.make_block_ptr(
+        base=Kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    V_bp = tl.make_block_ptr(
+        base=Vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    O_bp = tl.make_block_ptr(
+        base=Ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(pid_q * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    L_bp = tl.make_block_ptr(
+        base=Lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(pid_q * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    # load the Q tile
+    # keep the original dtype for the final store cast
+    q_raw = tl.load(Q_bp, boundary_check=(0, 1), padding_option="zero")
+    q = q_raw.to(tl.float32)
 
     # running state (on-chip)
     m = tl.full((Q_TILE_SIZE,), -float("inf"), tl.float32)  # [Bq]
     l = tl.zeros((Q_TILE_SIZE,), tl.float32)                # [Bq]
     acc = tl.zeros((Q_TILE_SIZE, D), tl.float32)            # [Bq, D]
 
-    # loop over K tiles
-    for kb in tl.static_range(0, N_KEYS, K_TILE_SIZE):
-        k_offsets = kb + tl.arange(0, K_TILE_SIZE)  # [Bk]
+    # iterate over K/V tile by advancing block pointers (instead of re-building raw pointers)
+    K_it = K_bp
+    V_it = V_bp
 
-        k_ptrs = K_ptr + pid_b * stride_kb + k_offsets[:, None] * stride_kk + d_offsets[None, :] * stride_kd
-        v_ptrs = V_ptr + pid_b * stride_vb + k_offsets[:, None] * stride_vk + d_offsets[None, :] * stride_vd
-    
-        k = tl.load(k_ptrs, mask=(k_offsets[:, None] < N_KEYS), other=0.0).to(tl.float32)  # [Bk, D]
-        v = tl.load(v_ptrs, mask=(k_offsets[:, None] < N_KEYS), other=0.0)                 # [Bk, D]
+    # absolute query indices used only for causal masking
+    q_abs = pid_q * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
+    for kb in range(0, N_KEYS, K_TILE_SIZE):
+        # load one (K_TILE_SIZE, D) tile of K and V
+        k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bk, D]
+        v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero")                 # [Bk, D]
 
         # S = q @ k^T * scale -> [Bq, Bk]
         S = tl.dot(q, tl.trans(k)) * scale  # float32
 
         # causal mask: keep if q_idx >= k_idx else -1e-6
         if IS_CAUSAL:
-            q_abs = q_offsets[:, None]  # [Bq, 1]
-            k_abs = k_offsets[None, :]  # [1, Bk]
-            causal = q_abs >= k_abs
-            S = tl.where(causal, S, -1.0e6)
-        
+            k_abs = kb + tl.arange(0, K_TILE_SIZE)
+            S = tl.where(q_abs[:, None] >= k_abs[None, :], S, -1.0e6)
+
         # online softmax update
         m_new = tl.maximum(m, tl.max(S, axis=1))  # [Bq]
         p = tl.exp(S - m_new[:, None])            # [Bq, Bk]
@@ -74,17 +121,19 @@ def flash_fwd_kernel(
 
         m = m_new
         l = l_new
-    
-    # write O and L
-    o = acc / l[:, None]
-    o = o.to(tl.float32)
 
-    o_ptrs = O_ptr + pid_b * stride_ob + q_offsets[:, None] * stride_oq + d_offsets[None, :] * stride_od
-    tl.store(o_ptrs, o, mask=(q_offsets[:, None] < N_QUERIES))
+        # advance K/V block pointers to the next tile along the sequence dimension
+        K_it = K_it.advance((K_TILE_SIZE, 0))
+        V_it = V_it.advance((K_TILE_SIZE, 0))
+
+    # write O and L
+    # store output in the original input dtype
+    o = (acc / l[:, None]).to(q_raw.dtype)
+
+    tl.store(O_bp, o, boundary_check=(0, 1))
 
     L_out = m + tl.log(l)  # [Bq]
-    l_ptrs = L_ptr + pid_b * stride_lb + q_offsets * stride_lq
-    tl.store(l_ptrs, L_out, mask=(q_offsets < N_QUERIES))
+    tl.store(L_bp, L_out, boundary_check=(0,))
 
 
 class FlashAttention2Triton(torch.autograd.Function):
