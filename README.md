@@ -27,6 +27,7 @@ Dependencies are automatically installed based on each assignment's `pyproject.t
 
 - [Stanford | CS336 | Language Modeling from Scratch | Spring 2025 | Assignment 1: Basics | BPE Tokenizer Implement](https://blog.csdn.net/qq_40672115/article/details/156488018)
 - [Stanford | CS336 | Language Modeling from Scratch | Spring 2025 | Assignment 1: Basics | Transformer LM Architecture Implement](https://blog.csdn.net/qq_40672115/article/details/156534682)
+- [Stanford | CS336 | Language Modeling from Scratch | Spring 2025 | Assignment 1: Basics | Training Loop Implement](https://blog.csdn.net/qq_40672115/article/details/156698279)
 
 ## Assignments
 
