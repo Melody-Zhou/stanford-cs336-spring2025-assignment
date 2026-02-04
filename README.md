@@ -66,6 +66,17 @@ Dependencies are automatically installed based on each assignment's `pyproject.t
 
 >**Note**：Due to the lack of official API access, this assignment could not be fully tested int the current environment. Please refer to: [https://github.com/stanford-cs336/assignment3-scaling/issues/1](https://github.com/stanford-cs336/assignment3-scaling/issues/1)
 
+### [Assignment 4: Data](./assignment4-data/)
+
+**what you will implement**
+
+1. Convert Common Crawl HTML to text.
+2. Filter the extracted text with various methods (e.g., harmful content, personal identifiable information, etc.).
+3. Deduplicate the training data.
+
+**What you will run**
+
+1. Train language models on different datasets to better understand the impact of particular processing decisions on performance.
 ## Reference
 
 - [https://github.com/stanford-cs336/assignment1-basics](https://github.com/stanford-cs336/assignment1-basics/tree/main)
